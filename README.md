@@ -1,2 +1,2 @@
 # ntoo
-test installer gentoo
+test installer gentoo, tested under VM (VirtualBox)

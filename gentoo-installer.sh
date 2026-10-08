@@ -59,7 +59,6 @@ check_dependencies() {
 
     local deps=(
         wget
-        curl
         tar
         xz
         sha256sum
@@ -68,14 +67,18 @@ check_dependencies() {
         mkswap
         mount
         chroot
-        grub-install
     )
 
     for cmd in "${deps[@]}"; do
-        command -v "$cmd" >/dev/null 2>&1 || {
+        if ! command -v "$cmd" >/dev/null 2>&1; then
             echo "[!] Missing command: $cmd"
-        }
-    }
+            missing=1
+        fi
+    done
+
+    if [[ "${missing:-0}" -eq 1 ]]; then
+        die "One or more required commands are missing from the live environment."
+    fi
 
     command -v sfdisk >/dev/null 2>&1 ||
         die "sfdisk is required."
@@ -91,24 +94,26 @@ check_dependencies() {
 
     command -v tar >/dev/null 2>&1 ||
         die "tar is required."
+
+    command -v blockdev >/dev/null 2>&1 ||
+        die "blockdev is required."
+
+    command -v wipefs >/dev/null 2>&1 ||
+        die "wipefs is required."
 }
 
 check_network() {
     log "Checking network"
 
-    if ping -c 1 -W 3 distfiles.gentoo.org >/dev/null 2>&1; then
-        echo "[OK] Network works."
+    if wget -q --spider --timeout=8 https://distfiles.gentoo.org/; then
+        echo "[OK] Network + HTTPS works."
     else
-        echo "[!] DNS/network test failed."
+        echo "[!] Cannot reach distfiles.gentoo.org over HTTPS."
         echo
         echo "Try:"
-        echo "    ping 1.1.1.1"
-        echo "    ping distfiles.gentoo.org"
+        echo "    wget -S --spider https://distfiles.gentoo.org/"
         echo
-        read -rp "Continue anyway? [y/N]: " answer
-
-        [[ "$answer" =~ ^[Yy]$ ]] ||
-            die "Network unavailable."
+        die "Network unavailable."
     fi
 }
 
@@ -138,44 +143,58 @@ partition_disk() {
     log "Partitioning $DISK"
 
     swapoff -a 2>/dev/null || true
-
     umount "${DISK}"* 2>/dev/null || true
 
-    # Remove old filesystem signatures.
-    wipefs -a "$DISK" || true
+    log "Removing old partition/filesystem signatures"
+    wipefs -a "$DISK"
 
-    # MBR/DOS partition table:
-    #
-    # 1 = root      7G
-    # 2 = swap      remainder
-    #
-    # For VM disks >= 8G.
+    local sector_size total_sectors swap_bytes swap_sectors first_sector root_sectors swap_start
+
+    sector_size="$(blockdev --getss "$DISK")"
+    total_sectors="$(blockdev --getsz "$DISK")"
+    swap_bytes=$((2 * 1024 * 1024 * 1024))
+    swap_sectors=$(( (swap_bytes + sector_size - 1) / sector_size ))
+    first_sector=2048
+
+    (( total_sectors > first_sector + swap_sectors )) ||
+        die "Disk is too small for root + 2 GiB swap."
+
+    root_sectors=$((total_sectors - first_sector - swap_sectors))
+    swap_start=$((first_sector + root_sectors))
+
+    echo
+    echo "[+] Partition layout:"
+    echo "    $DISK"
+    echo "    ├── ${DISK}1  root  ext4  $((root_sectors * sector_size / 1024 / 1024 / 1024)) GiB"
+    echo "    └── ${DISK}2  swap  2 GiB"
+    echo
+
     sfdisk --wipe always "$DISK" <<EOF
 label: dos
+unit: sectors
 
-start=2048, size=+, type=83, bootable
-start=, size=+, type=82
+start=$first_sector, size=$root_sectors, type=83, bootable
+start=$swap_start, size=$swap_sectors, type=82
 EOF
 
     partprobe "$DISK" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
     sleep 2
 
     ROOT="${DISK}1"
     SWAP="${DISK}2"
 
-    [[ -b "$ROOT" ]] ||
-        die "Root partition $ROOT was not created."
-
-    [[ -b "$SWAP" ]] ||
-        die "Swap partition $SWAP was not created."
+    [[ -b "$ROOT" ]] || die "Root partition $ROOT was not created."
+    [[ -b "$SWAP" ]] || die "Swap partition $SWAP was not created."
 
     log "Formatting root filesystem"
-
     mkfs.ext4 -F -L GENTOO_ROOT "$ROOT"
 
     log "Creating swap"
-
     mkswap -L GENTOO_SWAP "$SWAP"
+
+    echo
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$DISK"
 }
 
 mount_filesystems() {
@@ -190,7 +209,7 @@ mount_filesystems() {
     mount --rbind /dev "$MNT/dev"
     mount --make-rslave "$MNT/dev"
 
-    mount -t proc /proc "$MNT/proc"
+    mount -t proc proc "$MNT/proc"
 
     mount --rbind /sys "$MNT/sys"
     mount --make-rslave "$MNT/sys"
@@ -202,42 +221,40 @@ mount_filesystems() {
 download_stage3() {
     log "Downloading current Gentoo i686 OpenRC Stage3"
 
-    mkdir -p "$MNT/root/stage3"
+    local stage_dir="$MNT/root/stage3"
+    local latest_file latest_url checksum_file
 
-    cd "$MNT/root/stage3"
+    mkdir -p "$stage_dir"
+    cd "$stage_dir"
 
-    local latest_file
     latest_file="$(
-        wget -qO- \
-        "$STAGE_BASE/latest-stage3-i686-openrc.txt" |
-        grep -E '^stage3-i686-openrc-.*\.tar\.xz$' |
+        wget -qO- "$STAGE_BASE/latest-stage3-i686-openrc.txt" |
+        awk '$1 !~ /^#/ && $1 ~ /^stage3-i686-openrc-.*\.tar\.xz$/ {print $1}' |
         tail -n 1
     )"
 
     [[ -n "$latest_file" ]] ||
-        die "Could not determine current Stage3."
+        die "Could not determine current i686 OpenRC Stage3 filename."
 
-    echo "[+] Stage3:"
-    echo "    $latest_file"
+    latest_url="$STAGE_BASE/$latest_file"
+    checksum_file="$latest_file.sha256"
 
-    wget -c \
-        "$STAGE_BASE/$latest_file"
+    echo "[+] Stage3: $latest_file"
 
-    wget -c \
-        "$STAGE_BASE/$latest_file.sha256"
+    wget -c --tries=5 --timeout=30 "$latest_url"
+    wget -c --tries=5 --timeout=30 "$STAGE_BASE/$checksum_file"
 
     log "Verifying Stage3 SHA256"
-
-    sha256sum -c "$latest_file.sha256"
+    sha256sum -c "$checksum_file"
 
     log "Extracting Stage3"
 
-    tar xpvf "$latest_file" \
-        --xattrs-include='*.*' \
+    tar xpf "$latest_file" \
+        --xattrs-include='*' \
         --numeric-owner \
         -C "$MNT"
 
-    rm -rf "$MNT/root/stage3"
+    rm -rf "$stage_dir"
 }
 
 configure_dns() {
@@ -268,20 +285,12 @@ UUID=$swap_uuid    none    swap    sw             0 0
 EOF
 }
 
-copy_resolv_for_chroot() {
-    cp -L /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
-}
-
 prepare_chroot() {
     log "Preparing Gentoo chroot"
 
-    cp -L /etc/resolv.conf "$MNT/etc/resolv.conf"
-
-    # Copy timezone information.
-    if [[ -e "/usr/share/zoneinfo/$TIMEZONE" ]]; then
-        mkdir -p "$MNT/etc"
-        cp "/usr/share/zoneinfo/$TIMEZONE" "$MNT/etc/localtime"
-    fi
+    # Keep DNS from the installer environment when possible.
+    # configure_dns() already wrote known-good resolvers for the chroot.
+    [[ -e "$MNT/etc/resolv.conf" ]] || configure_dns
 }
 
 create_install_script() {
@@ -296,6 +305,7 @@ export LC_ALL=C
 
 HOSTNAME="gentoo32"
 TIMEZONE="Asia/Jakarta"
+TARGET_DISK="__TARGET_DISK__"
 
 log() {
     echo
@@ -328,17 +338,11 @@ CXXFLAGS="${COMMON_FLAGS}"
 
 MAKEOPTS="-j2"
 
-FEATURES="ccache"
-
 ACCEPT_LICENSE="*"
 
 GRUB_PLATFORMS="pc"
 
-VIDEO_CARDS=""
-
-INPUT_DEVICES="libinput"
-
-USE="X alsa dbus elogind ipv6 openrc pam"
+USE="alsa dbus ipv6 openrc pam"
 
 EMERGE_DEFAULT_OPTS="--ask=n"
 
@@ -395,7 +399,7 @@ if [[ -e "/usr/share/zoneinfo/$TIMEZONE" ]]; then
     ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 fi
 
-echo "UTC" > /etc/timezone
+echo "$TIMEZONE" > /etc/timezone
 
 log "Configuring locale"
 
@@ -411,7 +415,9 @@ if command -v eselect >/dev/null 2>&1; then
 fi
 
 env-update
-source /etc/profile
+# Do not source /etc/profile while `set -u` is active.
+# Some Gentoo profile fragments reference optional variables such as
+# DEBUGINFO_URLS; sourcing them here can abort the installer.
 
 log "Setting hostname"
 
@@ -423,24 +429,41 @@ cat > /etc/hosts <<'EOF'
 ::1             localhost
 EOF
 
+log "Preparing kernel USE flags"
+
+# Current Gentoo distribution kernels require initramfs support,
+# and installkernel needs dracut to generate the initramfs.
+# Configure these explicitly so emerge does not stop asking for
+# --autounmask-write / --autounmask-continue.
+mkdir -p /etc/portage/package.use
+
+cat > /etc/portage/package.use/zz-gentoo-installer <<'EOF'
+sys-kernel/gentoo-kernel-bin initramfs
+sys-kernel/installkernel dracut
+EOF
+
 log "Installing essential packages"
 
-emerge \
+emerge --update --newuse \
     sys-kernel/gentoo-kernel-bin \
     sys-boot/grub \
     net-misc/dhcpcd \
     app-admin/sudo \
     app-editors/nano
 
+log "Verifying installed kernel"
+
+if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
+    die "Kernel image was not installed in /boot."
+fi
+
+if ! ls /boot/initramfs-* >/dev/null 2>&1; then
+    die "Kernel initramfs was not generated in /boot."
+fi
+
 log "Configuring networking"
 
-cat > /etc/conf.d/net <<'EOF'
-config_eth0="dhcp"
-EOF
-
-ln -sf /etc/init.d/net.lo /etc/init.d/net.eth0
-
-rc-update add net.eth0 default
+rc-update add dhcpcd default
 
 log "Configuring root password"
 
@@ -483,15 +506,16 @@ log "Installing GRUB bootloader"
 grub-install \
     --target=i386-pc \
     --recheck \
-    /dev/sda
+    "$TARGET_DISK"
 
 log "Generating GRUB configuration"
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
-log "Enabling important services"
+log "Verifying enabled services"
 
-rc-update add dhcpcd default 2>/dev/null || true
+rc-update show default | grep -q '^ *dhcpcd' ||
+    rc-update add dhcpcd default
 
 log "Checking installed kernel"
 
@@ -518,12 +542,14 @@ echo
 
 CHROOT_SCRIPT
 
+    sed -i "s|__TARGET_DISK__|$DISK|g" "$MNT/root/gentoo-chroot.sh"
     chmod +x "$MNT/root/gentoo-chroot.sh"
 }
 
 run_chroot() {
     log "Entering Gentoo chroot"
 
+    [[ -x "$MNT/root/gentoo-chroot.sh" ]] || die "Chroot installer was not created."
     chroot "$MNT" /bin/bash /root/gentoo-chroot.sh
 }
 
@@ -560,10 +586,10 @@ main() {
 
     partition_disk
     mount_filesystems
+    download_stage3
     configure_dns
     configure_fstab
     prepare_chroot
-    download_stage3
     create_install_script
     run_chroot
 

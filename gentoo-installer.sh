@@ -16,8 +16,10 @@ set -Eeuo pipefail
 
 export LC_ALL=C
 
-DISK="/dev/sda"
+DISK=""
 MNT="/mnt/gentoo"
+ROOT=""
+SWAP=""
 
 ARCH="i686"
 PROFILE="default/linux/x86/17.1"
@@ -66,6 +68,7 @@ check_dependencies() {
         mkfs.ext4
         mkswap
         mount
+        lsblk
         chroot
     )
 
@@ -117,33 +120,81 @@ check_network() {
     fi
 }
 
-check_disk() {
-    log "Checking target disk"
+partition_name() {
+    # Correctly handle /dev/sda -> /dev/sda1 and /dev/nvme0n1 -> /dev/nvme0n1p1.
+    local disk="$1" number="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        printf '%sp%s' "$disk" "$number"
+    else
+        printf '%s%s' "$disk" "$number"
+    fi
+}
 
-    [[ -b "$DISK" ]] ||
-        die "$DISK does not exist."
+detect_target_disk() {
+    log "Detecting available hard disks / SSDs"
+
+    local -a candidates=()
+    local name type removable size model mountpoints root_source root_parent
+    local i=0 choice
+
+    command -v lsblk >/dev/null 2>&1 || die "lsblk is required."
+    command -v findmnt >/dev/null 2>&1 || die "findmnt is required."
+
+    # Avoid offering the disk containing the currently mounted root filesystem.
+    root_source="$(findmnt -nro SOURCE / 2>/dev/null || true)"
+    if [[ -n "$root_source" && "$root_source" == /dev/* ]]; then
+        root_parent="$(lsblk -nro PKNAME "$root_source" 2>/dev/null | head -n1 || true)"
+        if [[ -n "$root_parent" ]]; then
+            root_source="/dev/$root_parent"
+        fi
+    fi
 
     echo
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$DISK" || true
-    echo
+    printf '%-4s %-16s %-9s %-8s %-7s %s\n' "No." "DEVICE" "SIZE" "TYPE" "RM" "MODEL"
+    printf '%-4s %-16s %-9s %-8s %-7s %s\n' "---" "------" "----" "----" "--" "-----"
 
-    echo "TARGET DISK:"
-    echo "    $DISK"
-    echo
-    echo "ALL DATA ON THIS DISK WILL BE DESTROYED."
-    echo
+    while read -r name type removable size model; do
+        [[ "$type" == "disk" ]] || continue
+        [[ -b "$name" ]] || continue
+        # Skip removable disks (often the installer USB) by default.
+        [[ "$removable" == "0" ]] || continue
+        # Skip the disk hosting the currently running root filesystem, when identifiable.
+        [[ -n "$root_source" && "$name" == "$root_source" ]] && continue
 
-    read -rp "Type WIPE to continue: " confirm
+        # Never offer disks with mounted descendants, to reduce accidental destruction.
+        mountpoints="$(lsblk -nrpo MOUNTPOINT "$name" | sed '/^[[:space:]]*$/d' || true)"
+        [[ -z "$mountpoints" ]] || continue
 
-    [[ "$confirm" == "WIPE" ]] ||
-        die "Aborted."
+        candidates+=("$name")
+        ((i+=1))
+        printf '%-4s %-16s %-9s %-8s %-7s %s\n' "$i" "$name" "$size" "$type" "$removable" "${model:-Unknown}"
+    done < <(lsblk -dnpo NAME,TYPE,RM,SIZE,MODEL)
+
+    ((${#candidates[@]} > 0)) || die "No eligible non-removable, unmounted disk found. Check lsblk output and target disk mounts."
+
+    echo
+    read -r -p "Select target disk number (all data on it will be destroyed): " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid disk selection."
+    (( choice >= 1 && choice <= ${#candidates[@]} )) || die "Selection out of range."
+
+    DISK="${candidates[$((choice-1))]}"
+    ROOT="$(partition_name "$DISK" 1)"
+    SWAP="$(partition_name "$DISK" 2)"
+
+    echo
+    echo "Selected target disk:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL "$DISK"
+    echo
+    echo "WARNING: ALL DATA ON $DISK WILL BE DESTROYED."
+    read -r -p "Type WIPE to confirm this exact disk: " confirm
+    [[ "$confirm" == "WIPE" ]] || die "Aborted."
 }
 
 partition_disk() {
     log "Partitioning $DISK"
 
     swapoff -a 2>/dev/null || true
-    umount "${DISK}"* 2>/dev/null || true
+    umount "${ROOT:-$(partition_name "$DISK" 1)}" "${SWAP:-$(partition_name "$DISK" 2)}" 2>/dev/null || true
 
     log "Removing old partition/filesystem signatures"
     wipefs -a "$DISK"
@@ -180,9 +231,6 @@ EOF
     partprobe "$DISK" 2>/dev/null || true
     udevadm settle 2>/dev/null || true
     sleep 2
-
-    ROOT="${DISK}1"
-    SWAP="${DISK}2"
 
     [[ -b "$ROOT" ]] || die "Root partition $ROOT was not created."
     [[ -b "$SWAP" ]] || die "Swap partition $SWAP was not created."
@@ -448,6 +496,7 @@ emerge --update --newuse \
     sys-kernel/gentoo-kernel-bin \
     sys-boot/grub \
     net-misc/dhcpcd \
+    net-misc/networkmanager \
     app-admin/sudo \
     app-editors/nano
 
@@ -463,7 +512,11 @@ fi
 
 log "Configuring networking"
 
-rc-update add dhcpcd default
+# NetworkManager provides nmcli and manages Wi-Fi/Ethernet.
+# Do not run dhcpcd and NetworkManager together on the same interface.
+rc-update del dhcpcd default 2>/dev/null || true
+rc-service dhcpcd stop 2>/dev/null || true
+rc-update add NetworkManager default
 
 log "Configuring root password"
 
@@ -512,10 +565,13 @@ log "Generating GRUB configuration"
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
-log "Verifying enabled services"
+log "Verifying networking"
 
-rc-update show default | grep -q '^ *dhcpcd' ||
-    rc-update add dhcpcd default
+command -v nmcli >/dev/null 2>&1 ||
+    die "NetworkManager/nmcli was not installed."
+
+rc-update show default | grep -q 'NetworkManager' ||
+    rc-update add NetworkManager default
 
 log "Checking installed kernel"
 
@@ -573,7 +629,7 @@ main() {
     echo "       GENTOO x86/i686 AUTOMATIC INSTALLER"
     echo "============================================================"
     echo
-    echo "Target : $DISK"
+    echo "Target : auto-detected disk selection"
     echo "Arch   : i686"
     echo "Init   : OpenRC"
     echo "Boot   : BIOS/MBR"
@@ -581,8 +637,8 @@ main() {
     echo
 
     check_dependencies
+    detect_target_disk
     check_network
-    check_disk
 
     partition_disk
     mount_filesystems
